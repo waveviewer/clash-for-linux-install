@@ -43,12 +43,16 @@ _detect_proxy_port() {
     [ -n "$port" ] && _is_port_used "$port" && [ "$service_active" != "true" ] && {
       new_port=$(_get_random_port) || return
       count=$((count + 1))
-      _failcat '🎯' "端口冲突：[$yaml_key] $port 🎲 随机分配 $new_port"
+      _ui_warn "端口冲突：[$yaml_key] $port，随机分配 $new_port"
       "$BIN_YQ" -i ".${yaml_key} = $new_port" "$CLASH_CONFIG_MIXIN"
     }
   done
 
-  [ "$count" -gt 0 ] && _merge_config
+  if [ "$count" -gt 0 ] && ! _merge_config; then
+    _errorcat '代理端口已调整，但运行配置更新失败'
+    return 1
+  fi
+  return 0
 }
 
 _detect_ext_addr() {
@@ -68,11 +72,12 @@ _detect_ext_addr() {
   _is_port_used "$EXT_PORT" && [ "$service_active" != "true" ] && {
     local new_port
     new_port=$(_get_random_port) || return
-    _failcat '🎯' "端口冲突：[external-controller] ${EXT_PORT} 🎲 随机分配 $new_port"
+    _ui_warn "端口冲突：[external-controller] ${EXT_PORT}，随机分配 $new_port"
     EXT_PORT=$new_port
     EXT_ADDR="$ext_ip:$new_port" "$BIN_YQ" -i '.external-controller = env(EXT_ADDR)' "$CLASH_CONFIG_MIXIN"
     _merge_config
   }
+  return 0
 }
 
 _get_secret() {
@@ -84,7 +89,9 @@ _valid_config() {
   [[ ! -e "$config" || "$(wc -l <"$config")" -lt 1 ]] && return 1
 
   local test_log
-  test_log=$("$BIN_KERNEL" -d "$(dirname "$config")" -f "$config" -t 2>&1) || {
+  # 校验须与服务同工作目录（resources/ 内含随仓库分发的 geodata）：
+  # 配置已迁到 data/，若用 -d "$(dirname config)" 内核会在校验期现下载 geodata。
+  test_log=$("$BIN_KERNEL" -d "$CLASH_RESOURCES_DIR" -f "$config" -t 2>&1) || {
     printf '%s\n' "$test_log" >&2
     grep -qs "unsupport proxy type" <<<"$test_log" && {
       local prefix="检测到订阅中包含不受支持的代理协议"
@@ -96,6 +103,36 @@ _valid_config() {
     }
     return 1
   }
+}
+
+# 主配置与订阅使用相同的节点结构约束：解析失败也必须拒绝。
+_has_proxy_nodes() {
+  [ -s "$1" ] && "$BIN_YQ" -e '
+      ((.proxies | type) == "!!seq" and (.proxies | length) > 0) or
+      ((.proxy-providers | type) == "!!map" and (.proxy-providers | length) > 0)
+    ' "$1" >/dev/null 2>&1
+}
+
+# service.sh 启动服务前的门禁：主配置必须存在、有节点且通过内核校验。
+_require_base_config() {
+  if [ ! -s "$CLASH_CONFIG_BASE" ]; then
+    _ui_error '尚未配置订阅，无法启动内核'
+    _ui_detail '添加并启用订阅' 'clashctl sub add --use "<URL>"'
+    return 1
+  fi
+  if ! _has_proxy_nodes "$CLASH_CONFIG_BASE"; then
+    _ui_error '主配置无效或缺少代理节点，无法启动内核'
+    _ui_detail '配置文件' "$CLASH_CONFIG_BASE"
+    return 1
+  fi
+  local validation_log
+  if validation_log=$(_valid_config "$CLASH_CONFIG_BASE" 2>&1); then
+    return 0
+  fi
+  _ui_error '主配置校验失败，无法启动内核'
+  _ui_detail '配置文件' "$CLASH_CONFIG_BASE"
+  [ -z "$validation_log" ] || printf '%s\n' "$validation_log" >&2
+  return 1
 }
 
 _merge_config() {
@@ -114,6 +151,19 @@ _merge_config() {
       $mixin |= del(._custom) |
       (($config // {}) * $mixin) as $runtime |
       $runtime |
+
+      ########################################
+      #        Tun DNS fallback              #
+      ########################################
+      # DNS 默认不接管，仅在 Tun 开启且无任何 dns 配置时补
+      # 最小骨架，避免 dns-hijack 劫持的查询收到 SERVFAIL。
+      (((.tun.enable // false) == true)) as $tunOn |
+      (select($tunOn and ((.dns // {}) | keys | length) == 0) | .dns = {
+        "enable": true,
+        "listen": "0.0.0.0:1053",
+        "enhanced-mode": "fake-ip",
+        "nameserver": ["114.114.114.114", "8.8.8.8"]
+      }) // . |
 
       ########################################
       #               Rules                  #
@@ -174,34 +224,32 @@ _merge_config() {
   _valid_config "$CLASH_CONFIG_RUNTIME" || {
     cat "$CLASH_CONFIG_TEMP" >"$CLASH_CONFIG_RUNTIME"
     _errorcat "验证失败：请检查 Mixin 配置"
+    return 1
   }
 }
 tunstatus() {
-  local device
-  device=$("$BIN_YQ" '.tun.device // ""' "$CLASH_CONFIG_RUNTIME")
-  [ -z "$device" ] && device="Meta"
-  ip link show | grep -qs "$device" && {
-    _okcat 'Tun 状态：启用'
+  _tun_is_active && {
+    printf 'Tun 状态：启用\n'
     return 0
   }
-  _failcat 'Tun 状态：关闭'
+  printf 'Tun 状态：关闭\n' >&2
   return 1
 }
 _is_tun_enabled() {
   "$BIN_YQ" -e '.tun.enable == true' "$CLASH_CONFIG_RUNTIME" >&/dev/null
 }
 _merge_config_restart() {
-  local was_tun_active tun_enabled
+  local was_tun_active=false
 
   tunstatus >&/dev/null && was_tun_active=true
-  _merge_config || return
-  _is_tun_enabled && tun_enabled=true
+  # rc=1：合并/校验失败（runtime 已由 _merge_config 回滚为旧配置）
+  _merge_config || return 1
 
   if [ "${was_tun_active}" = true ]; then
     service_sudo_stop >/dev/null
     service_is_active >&/dev/null && {
       _errorcat "请先关闭 Tun 模式"
-      return
+      return 2
     }
   else
     service_stop >&/dev/null
@@ -209,12 +257,15 @@ _merge_config_restart() {
 
   sleep 0.1
 
-  if [ "${tun_enabled}" = true ]; then
+  # rc=2：合并成功（runtime 已是新配置）但服务重启失败
+  if _is_tun_enabled; then
     service_sudo_start >/dev/null
     sleep 1
-    tunstatus >&/dev/null || _errorcat "Tun 模式重启失败，请检查代理内核日志" || return
+    tunstatus >&/dev/null || {
+      _errorcat "Tun 模式重启失败，请检查代理内核日志"
+      return 2
+    }
   else
-    service_start >/dev/null
-
+    service_start >/dev/null || return 2
   fi
 }
